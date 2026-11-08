@@ -175,7 +175,8 @@ h2{font-family:var(--f-display);font-weight:400;font-size:1.05rem;margin:4px 0 0
     <div class="row"><label for="repeat">繰り返し再生</label><span class="switch"><input type="checkbox" id="repeat"><span></span></span></div>
     <div class="row"><label for="interval">繰り返しの間隔</label>
       <select id="interval"><option value="0">すぐ</option><option value="3">3秒</option><option value="5">5秒</option><option value="10">10秒</option><option value="30">30秒</option></select></div>
-    <div class="row" id="procRow"><label for="proc">聞き取りやすく加工<br><span class="sub">オフにすると元の録音のまま</span></label><span class="switch"><input type="checkbox" id="proc"><span></span></span></div>
+    <div class="row" id="procRow"><label for="level">加工の強さ<br><span class="sub">「最大」は音が少し硬くなります</span></label>
+      <select id="level"><option value="0">なし</option><option value="1">ふつう</option><option value="2">最大</option></select></div>
     <div class="row"><label for="vol">再生の音量</label><span class="sub" id="volVal"></span></div>
     <input type="range" id="vol" min="10" max="100" step="5">
   </div>
@@ -197,10 +198,11 @@ const MAX_REC = 30, MAX_ITEMS = 5;
 const inFrame = (() => { try { return window.parent !== window; } catch (e) { return true; } })();
 
 /* ---------- 設定 ---------- */
-const DEF = {mode:'rec', repeat:false, interval:5, proc:true, vol:100, rate:0.9, liveVol:30, aec:false,
+const DEF = {mode:'rec', repeat:false, interval:5, level:1, vol:100, rate:0.9, liveVol:30, aec:false,
   text:'まもなく始まります。お近くの方は、前の方へお集まりください。'};
 let S = Object.assign({}, DEF);
 try { S = Object.assign(S, JSON.parse(localStorage.getItem('kk-settings') || '{}')); } catch (e) {}
+if (S.proc === false && S.level === 1) S.level = 0; delete S.proc;
 const saveS = () => { try { localStorage.setItem('kk-settings', JSON.stringify(S)); } catch (e) {} };
 
 /* ---------- 小物 ---------- */
@@ -266,18 +268,32 @@ function trim(d, sr){
   return d.slice(Math.max(0, a*w-pad), Math.min(d.length, (b+1)*w+pad));
 }
 function render(oc){ return new Promise((res, rej) => { oc.oncomplete = e => res(e.renderedBuffer); const p = oc.startRendering(); if (p && p.catch) p.catch(rej); }); }
-async function processAudio(d, sr){
+/* 1 = ふつう, 2 = 最大(低音をさらに削り、耳に届きやすい高さを強め、強く圧縮して少しだけ歪ませる) */
+const LEVELS = {
+  1:{hp:150, pkHz:3000, pkDb:4, th:-28, ratio:4, atk:0.004, rel:0.18, drive:0},
+  2:{hp:300, pkHz:2500, pkDb:7, th:-40, ratio:10, atk:0.002, rel:0.12, drive:2.5}
+};
+async function processAudio(d, sr, level){
+  const P = LEVELS[level || 1];
   const tail = Math.floor(sr*0.25);
   const OC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
   const oc = new OC(1, d.length+tail, sr);
   const b = oc.createBuffer(1, d.length, sr); b.getChannelData(0).set(d);
   const s = oc.createBufferSource(); s.buffer = b;
   const pre = oc.createGain(); pre.gain.value = 0.9/Math.max(peak(d), 1e-4);
-  const hp = oc.createBiquadFilter(); hp.type='highpass'; hp.frequency.value=150; hp.Q.value=0.7;
-  const pk = oc.createBiquadFilter(); pk.type='peaking'; pk.frequency.value=3000; pk.Q.value=0.9; pk.gain.value=4;
-  const comp = oc.createDynamicsCompressor(); comp.threshold.value=-28; comp.knee.value=8; comp.ratio.value=4; comp.attack.value=0.004; comp.release.value=0.18;
+  const hp = oc.createBiquadFilter(); hp.type='highpass'; hp.frequency.value=P.hp; hp.Q.value=0.7;
+  const pk = oc.createBiquadFilter(); pk.type='peaking'; pk.frequency.value=P.pkHz; pk.Q.value=0.9; pk.gain.value=P.pkDb;
+  const comp = oc.createDynamicsCompressor(); comp.threshold.value=P.th; comp.knee.value=8; comp.ratio.value=P.ratio; comp.attack.value=P.atk; comp.release.value=P.rel;
   const lim = oc.createDynamicsCompressor(); lim.threshold.value=-6; lim.knee.value=0; lim.ratio.value=20; lim.attack.value=0.001; lim.release.value=0.08;
-  s.connect(pre); pre.connect(hp); hp.connect(pk); pk.connect(comp); comp.connect(lim); lim.connect(oc.destination);
+  s.connect(pre); pre.connect(hp); hp.connect(pk); pk.connect(comp);
+  if (P.drive) {
+    const ws = oc.createWaveShaper(), n = 2048, curve = new Float32Array(n), k = P.drive, nk = Math.tanh(k);
+    for (let i=0;i<n;i++){ const x = i*2/(n-1) - 1; curve[i] = Math.tanh(k*x)/nk; }
+    ws.curve = curve; ws.oversample = '4x';
+    const into = oc.createGain(); into.gain.value = 0.8;
+    comp.connect(into); into.connect(ws); ws.connect(lim);
+  } else comp.connect(lim);
+  lim.connect(oc.destination);
   s.start(0);
   const out = (await render(oc)).getChannelData(0);
   const o = trim(out, sr); const g = 0.97/Math.max(peak(o), 1e-4);
@@ -352,7 +368,7 @@ async function makeDraft(raw, sr){
   if (t.length < sr*0.3) { $('#statusRec').textContent = '声が入っていないか、短すぎます。もう一度どうぞ'; return; }
   if (t.length > sr*MAX_REC) { t = t.slice(0, sr*MAX_REC); toast('30秒を超えた分は切りました'); }
   let p;
-  try { p = await processAudio(t, sr); } catch (e) { p = t.slice(); }
+  try { p = await processAudio(t, sr, 1); } catch (e) { p = t.slice(); }
   draft = {type:'audio', raw:t, proc:p, sr, name:'呼びかけ '+stamp().replace('_',' ')};
   $('#draftName').value = draft.name; $('#draftLen').textContent = sec(t.length, sr);
   $('#draft').hidden = false; $('#statusRec').textContent = '';
@@ -387,13 +403,23 @@ function scheduleNext(fn){
   $('#ovNext').textContent = `次の再生まで ${left} 秒`;
   cdTimer = setInterval(() => { left--; if (left<=0){ clearInterval(cdTimer); $('#ovNext').textContent=''; fn(); } else $('#ovNext').textContent = `次の再生まで ${left} 秒`; }, 1000);
 }
-function playItem(item, repeat){
+async function dataFor(item){
+  const lv = Number(S.level);
+  if (lv === 0 || !item.proc) return item.raw;
+  if (lv === 1) return item.proc;
+  if (!item.loud) {
+    try { item.loud = await processAudio(item.raw, item.sr, 2); if (item.id) DB.put(item); }
+    catch (e) { return item.proc; }
+  }
+  return item.loud;
+}
+async function playItem(item, repeat){
   stopPlay();
   if (item.type === 'text') return speakItem(item, repeat);
   const c = ac(); setSession('playback');
-  const data = (S.proc && item.proc) ? item.proc : item.raw;
+  const data = await dataFor(item);
   let cache = bufCache.get(item); if (!cache) { cache = {}; bufCache.set(item, cache); }
-  const key = data === item.proc ? 'p' : 'r';
+  const key = data === item.loud ? 'l' : (data === item.proc ? 'p' : 'r');
   if (!cache[key]) { const b = c.createBuffer(1, data.length, item.sr); b.getChannelData(0).set(data); cache[key] = b; }
   const me = {kind:'audio', src:null}; play = me;
   const once = () => {
@@ -502,7 +528,9 @@ async function addItem(o){
 $('#draftPlay').onclick = () => draft && playItem(draft, false);
 $('#draftSave').onclick = async () => {
   if (!draft) return;
-  const ok = await addItem({id:newId(), type:'audio', name:($('#draftName').value.trim()||draft.name), raw:draft.raw, proc:draft.proc, sr:draft.sr, created:Date.now()});
+  const o = {id:newId(), type:'audio', name:($('#draftName').value.trim()||draft.name), raw:draft.raw, proc:draft.proc, sr:draft.sr, created:Date.now()};
+  if (draft.loud) o.loud = draft.loud;
+  const ok = await addItem(o);
   if (ok) { draft=null; $('#draft').hidden=true; }
 };
 $('#draftDrop').onclick = () => { stopPlay(); draft=null; $('#draft').hidden=true; $('#statusRec').textContent=''; };
@@ -523,8 +551,8 @@ function wav(d, sr){
   for (let i=0;i<n;i++){ const s=Math.max(-1,Math.min(1,d[i])); v.setInt16(44+i*2, s<0?s*0x8000:s*0x7fff, true); }
   return new Blob([b], {type:'audio/wav'});
 }
-function exportItem(it){
-  const blob = wav(S.proc ? it.proc : it.raw, it.sr);
+async function exportItem(it){
+  const blob = wav(await dataFor(it), it.sr);
   const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `${stamp()}_${it.name}.wav`;
   document.body.appendChild(a); a.click(); a.remove(); setTimeout(()=>URL.revokeObjectURL(a.href), 4000);
 }
@@ -577,7 +605,7 @@ const bind = (id, key, fmt, num) => { const el = $(id);
   if (el.type==='checkbox') { el.checked = !!S[key]; el.onchange = () => { S[key]=el.checked; saveS(); }; }
   else { el.value = S[key]; const show = () => fmt && fmt(el.value);
     el.oninput = () => { S[key] = num ? Number(el.value) : el.value; saveS(); show(); }; show(); } };
-bind('#repeat','repeat'); bind('#proc','proc'); bind('#aec','aec');
+bind('#repeat','repeat'); bind('#level','level', null, true); bind('#aec','aec');
 bind('#interval','interval', null, true);
 bind('#vol','vol', v => $('#volVal').textContent = v+'%', true);
 bind('#rate','rate', v => $('#rateVal').textContent = Number(v).toFixed(2)+'倍', true);
